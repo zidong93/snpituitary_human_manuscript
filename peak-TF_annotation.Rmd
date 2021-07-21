@@ -1,0 +1,206 @@
+---
+title: Get TFs motifs in scATAC data
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 3
+        toc_float: true
+---
+
+```{r}
+library(Seurat)
+library(Signac)
+
+# For motif matching
+library(motifmatchr)
+library(Matrix)
+
+# For TF binding sites
+library(JASPAR2018)
+library(TFBSTools)
+
+library(ggplot2)
+library(plotly)
+
+library(GenomeInfoDb)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+
+
+# Intro
+
+```{r}
+animal_id <- "HF1"
+```
+
+# Load Data
+
+## Multiome
+
+```{r}
+data <- readRDS(file.path("../data_seurat_object", paste0(animal_id, "_filtered.rds")))
+```
+
+## Get Motifs
+
+```{r}
+# modified from chromVAR (original function in chromVAR uses JASPAR2016 data)
+getJasparMotifs_new <- function(species = "Homo sapiens", collection = "CORE", ...) {
+  opts <- list()
+  opts["species"] <- species
+  opts["collection"] <- collection
+  opts <- c(opts, list(...))
+  out <- TFBSTools::getMatrixSet(JASPAR2018::JASPAR2018, opts)
+  if (!isTRUE(all.equal(TFBSTools::name(out), names(out)))) 
+    names(out) <- paste(names(out), TFBSTools::name(out), sep = "_")
+  return(out)
+}
+motifs <- getJasparMotifs_new(species = "Homo sapiens")
+```
+
+# Help functions
+
+```{r}
+# helpfunctions for saving sparse matrix
+source("../src/utils.R")
+```
+
+## Process motif match matrix
+
+```{r}
+# Remove Dimer ==========
+# For hetero-dimers, do the following steps:
+# 1. replicate the column into 2 columns. (A peak is annotate to both TF if it's annotated to the dimer)
+# 2. Combine the column with the same motif name into one column by an OR gate. 
+
+motif_mtx_remove_dimers <- function(motif_ix_mtx){
+  
+    motifs.select <- colnames(motif_ix_mtx)[grep(pattern = "::", colnames(motif_ix_mtx), fixed = T)]
+
+    motif_ix_mtx_processed <- motif_ix_mtx
+    motif_ix_mtx_processed <- motif_ix_mtx_processed[, setdiff(colnames(motif_ix_mtx_processed), motifs.select)]
+    
+    for(temp.motif in motifs.select){
+        motif.dimers <- strsplit(temp.motif, "::")[[1]]
+        for (x in motif.dimers){
+            if(x %in% colnames(motif_ix_mtx_processed)){
+                # If TF already in the matrix, use OR gate to combine the original TF column and the dimer column
+                motif_ix_mtx_processed[, x] <- motif_ix_mtx_processed[, x] | motif_ix_mtx[, temp.motif]
+            }else{
+                # If TF not in the matrix, use the dimer column for this TF
+                motif_ix_mtx_processed <- cbind(motif_ix_mtx_processed, motif_ix_mtx[, temp.motif])
+                colnames(motif_ix_mtx_processed)[ncol(motif_ix_mtx_processed)] <- x                                
+            }
+        }
+    }
+    
+    return(motif_ix_mtx_processed)
+}
+
+
+# Remove Variants =========
+# For TF variants (different splice forms), combine the columns by an OR gate. (A peak is annotated to a TF if it's annotated to any variant of the TF)
+# Assuming the dimers from the input has been removed
+
+motif_mtx_remove_variants <- function(motif_ix_mtx_nodimer){
+  
+    motifs.select <- colnames(motif_ix_mtx_nodimer)[grep(pattern = "\\(var\\.[0-9-]\\)", colnames(motif_ix_mtx_nodimer))]
+    
+    motif_ix_mtx_processed <- motif_ix_mtx_nodimer
+    motif_ix_mtx_processed <- motif_ix_mtx_processed[, setdiff(colnames(motif_ix_mtx_processed), motifs.select)]
+    
+    for(temp.motif in motifs.select){
+        x <- gsub(pattern = "\\(var\\.[0-9-]\\)", replacement = "", temp.motif)
+        if(x %in% colnames(motif_ix_mtx_processed)){
+            # If TF already in the matrix, use OR gate to combine the two variants of the TF
+            motif_ix_mtx_processed[, x] <- motif_ix_mtx_processed[, x] | motif_ix_mtx_nodimer[, temp.motif]
+        }else{
+            # If TF not in the matrix, use the variant column for this TF
+            motif_ix_mtx_processed <- cbind(motif_ix_mtx_processed, motif_ix_mtx_nodimer[, temp.motif])
+            colnames(motif_ix_mtx_processed)[ncol(motif_ix_mtx_processed)] <- x                                
+        }
+    }
+    
+    return(motif_ix_mtx_processed)
+}
+```
+
+
+# peaks: JASPAR + motifmatchr
+
+## Get Regions
+
+```{r}
+# get peaks callled in the scATAC data
+atac.peaks <- data@assays$ATAC@counts
+peaks <- StringToGRanges(row.names(atac.peaks), sep = c("-", "-"))
+
+# Check peaks overlap
+print(paste("peaks are disjoint?", isDisjoint(peaks)))
+```
+
+
+## Scan Motifs
+
+```{r}
+motif_ix <- matchMotifs(motifs, peaks, out = "scores", 
+                        genome = BSgenome.Hsapiens.UCSC.hg38,
+                        p.cutoff = 5e-05)
+```
+
+## Analysis
+
+### Scores
+
+distribution of match scores
+
+```{r}
+motif_ix_scores <- motif_ix@assays@data$motifScores
+row.names(motif_ix_scores) <- row.names(atac.peaks)
+colnames(motif_ix_scores) <- colnames(motif_ix)
+
+colnames(motif_ix_scores) <- gsub(pattern = "^MA[0-9]+\\.[0-9]_", replacement = "", colnames(motif_ix_scores))
+```
+
+
+### Numbers
+
+distribution of the number of motifs in each peak
+
+```{r}
+motif_ix_mtx <- motif_ix@assays@data$motifMatches + 0
+row.names(motif_ix_mtx) <- row.names(atac.peaks)
+colnames(motif_ix_mtx) <- gsub(pattern = "^MA[0-9]+\\.[0-9]_", replacement = "", colnames(motif_ix))
+print(dim(motif_ix_mtx))
+
+hist(abs(peaks@ranges@width), main = "peak lengths")
+hist(abs(peaks@ranges@width)[abs(peaks@ranges@width) < 2000], main = "peak lengths")
+
+hist(rowSums(motif_ix_mtx), main = "#TFs in each peak")
+hist(rowSums(motif_ix_mtx)[rowSums(motif_ix_mtx) < 50], main = "#TFs in each peak")
+```
+
+
+## Process: Remove Dimer & Variants
+
+```{r}
+motif_ix_mtx_nodimer <- motif_mtx_remove_dimers(motif_ix_mtx)
+motif_ix_mtx_nodimer_novariant <- motif_mtx_remove_variants(motif_ix_mtx_nodimer)
+```
+
+
+## Save
+
+```{r}
+output_dir <- file.path("./output_jaspar_motifmatchr/")
+dir.create(output_dir, showWarnings = F, recursive = T)
+
+write_count_matrix_sparse(motif_ix_mtx, 
+                          file.path(output_dir, paste0(animal_id, "_original")))
+write_count_matrix_sparse(motif_ix_mtx_nodimer_novariant, 
+                          file.path(output_dir, paste0(animal_id, "_nodimer_novariant")))
+```

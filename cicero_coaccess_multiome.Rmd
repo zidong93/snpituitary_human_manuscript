@@ -1,0 +1,141 @@
+---
+title: Run cicero on ATAC-seq data
+author: "Zidong"
+date: '`r format(Sys.Date(), "%Y-%B-%d")`'
+output:
+    html_document:
+        toc: true
+        toc_depth: 3
+        toc_float: true
+---
+
+
+```{r}
+
+# for single cell RNA-seq and ATAC-seq data
+library(Seurat)
+library(Signac)
+
+# For chromatin co-accessibility
+library(cicero)
+
+
+library(ggplot2)
+library(plotly)
+library(RColorBrewer)
+
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomeInfoDb)
+```
+
+
+```{r}
+animal_ids <- c("HF1")
+
+# ============
+# Run Cicero for each dataset
+# ============
+
+for (i in seq(1,1)){
+    animal_id <- animal_ids[i]
+    print(paste0(animal_id))
+    
+    # ============
+    # load data
+    # ============
+    ATAC_dir <- file.path("../data_seurat_object")
+    data.atac <- readRDS(file.path(ATAC_dir, paste0(animal_id,"_filtered", ".rds")))
+
+    print(table(data.atac$orig.ident, data.atac$cell.ident))
+    
+    # Create a GRange object for all the peaks in this dataset
+    peaks.all.gr <- StringToGRanges(rownames(data.atac), sep = c("-", "-"))
+    
+    
+    # ============
+    # Filter cell types
+    # ============
+    # Already filtered
+    
+    
+    # ============
+    # Preprocess
+    # ============
+    
+    # Load data into an object compatible to cicero
+    atac.peaks <- data.atac@assays$ATAC@counts
+    
+    # Cicero needs peak names to be 'chr_start_end'
+    temp_peak.names <- gsub(pattern = ":|-", replacement = "_", row.names(atac.peaks))
+    row.names(atac.peaks) <- temp_peak.names
+    
+    # cell metadata
+    temp_cell.metadata <- data.frame(cell.ident = data.atac@meta.data$cell.ident,
+                                     cell.ident.annot = data.atac@meta.data$cell.ident.annot,
+                                     nFeature = data.atac@meta.data$nFeature_ATAC,
+                                     nCount = data.atac@meta.data$nCount_ATAC)
+    row.names(temp_cell.metadata) <- colnames(atac.peaks)
+    
+    data.atac.cicero <- new_cell_data_set(expression_data = atac.peaks,
+                                          cell_metadata = temp_cell.metadata)
+    
+    # Ensure there are no peaks included with zero reads
+    data.atac.cicero <- monocle3::detect_genes(data.atac.cicero)
+    data.atac.cicero <- data.atac.cicero[Matrix::rowSums(exprs(data.atac.cicero)) != 0,] 
+
+    
+    # To run the cicero algorithm, the dimension of the data needs to be reduced.
+    data.atac.cicero <- detect_genes(data.atac.cicero)
+    data.atac.cicero <- estimate_size_factors(data.atac.cicero)
+    data.atac.cicero <- preprocess_cds(data.atac.cicero, method = "LSI")
+    data.atac.cicero <- reduce_dimension(data.atac.cicero, reduction_method = 'UMAP', 
+                                         preprocess_method = "LSI")
+    
+    p1 <- plot_cells(data.atac.cicero, color_cells_by = "cell.ident")
+    print(p1)
+    
+    # Use the reduced dimensions from UMAP to run the Cicero algorithm.
+    umap_coords <- reducedDims(data.atac.cicero)$UMAP
+    cicero_cds <- make_cicero_cds(data.atac.cicero, reduced_coordinates = umap_coords)
+
+    
+    # ============
+    # Run Cicero
+    # ============
+    
+    # Prepare the genome length dataframe required by run_cicero
+    temp_seqlengths <- seqlengths(BSgenome.Hsapiens.UCSC.hg38)
+    human.hg38.genome <- data.frame(chr = names(temp_seqlengths),
+                                    length = temp_seqlengths)
+    row.names(human.hg38.genome) <- human.hg38.genome$chr
+    
+    chromosomes <- seqlevels(StringToGRanges(row.names(data.atac), sep=c("-","-")))
+    human.hg38.genome <- human.hg38.genome[chromosomes,]
+    colnames(human.hg38.genome) <- c("V1", "V2")
+    
+    
+    # Run Ciceoro for each chromosome separately
+    output_dir <- file.path("./output", paste0(animal_id))
+    dir.create(output_dir, showWarnings = F, recursive = T)
+    
+    for (temp_chr in unique(seqnames(peaks.all.gr))){
+        if(grepl(pattern = "HF", animal_id) & temp_chr == "chrY"){
+            next
+        }
+        print(temp_chr)
+        sample_genome <- subset(human.hg38.genome, V1 == temp_chr)
+        
+        # run cicero
+        conns <- run_cicero(cicero_cds, sample_genome, window = 5e+05, sample_num = 100)
+        write.table(conns, 
+                    file = file.path(output_dir,
+                                     paste0("peak-peak_coaccess_", animal_id, "_", temp_chr, ".txt")),
+                    sep = "\t", col.names = T, row.names = F)
+    }
+    
+}
+
+```
+
+
+
